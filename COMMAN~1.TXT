@@ -1,0 +1,183 @@
+/* =====================================================================
+ *  Outlook 誤送信防止アドイン (Office.js)
+ *  ---------------------------------------------------------------
+ *  本文または件名に「社外秘」などのキーワードを含むメールについて、
+ *  社外ドメイン宛のアドレスが含まれていないかを送信前に検査する。
+ *
+ *  ===== カスタマイズ箇所はこの直下の CONFIG オブジェクトのみ =====
+ * ===================================================================== */
+
+const CONFIG = {
+  // 自社の社内ドメイン(複数可・@は不要・小文字推奨)
+  INTERNAL_DOMAINS: [
+    "company.co.jp"
+  ],
+
+  // 本文に含まれていたら「社内限定メール」と判定するキーワード
+  BODY_KEYWORDS: [
+    "目標株価",
+    "投資判断",
+  ],
+
+  // 件名で判定したいキーワード(不要なら空配列でOK)
+  SUBJECT_KEYWORDS: [
+  ],
+
+  // 添付ファイルがある場合は無条件でチェック対象とするか
+  CHECK_WHEN_ATTACHMENTS_EXIST: false
+};
+
+/* =====================================================================
+ *  Office.js 初期化
+ * ===================================================================== */
+Office.onReady();
+
+/* =====================================================================
+ *  OnMessageSend イベントハンドラ
+ *   - manifest.xml で FunctionName="checkSendHandler" として登録
+ * ===================================================================== */
+function checkSendHandler(event) {
+  const item = Office.context.mailbox.item;
+
+  // 並列で各種情報を取得
+  Promise.all([
+    getAsync(cb => item.subject.getAsync(cb)),
+    getAsync(cb => item.body.getAsync(Office.CoercionType.Text, cb)),
+    getAsync(cb => item.to.getAsync(cb)),
+    getAsync(cb => item.cc.getAsync(cb)),
+    getAsync(cb => item.bcc.getAsync(cb)),
+    getAttachments(item)
+  ]).then(function (results) {
+    const subject       = results[0] || "";
+    const bodyText      = results[1] || "";
+    const toList        = results[2] || [];
+    const ccList        = results[3] || [];
+    const bccList       = results[4] || [];
+    const attachments   = results[5] || [];
+
+    // --- 1) チェック対象のメールかを判定 ---
+    const isTarget =
+      (CONFIG.CHECK_WHEN_ATTACHMENTS_EXIST && attachments.length > 0) ||
+      containsKeyword(bodyText, CONFIG.BODY_KEYWORDS) ||
+      containsKeyword(subject,  CONFIG.SUBJECT_KEYWORDS);
+
+    if (!isTarget) {
+      event.completed({ allowEvent: true });
+      return;
+    }
+
+    // --- 2) 全受信者から社外アドレスを抽出 ---
+    const allRecipients = []
+      .concat(toList.map(function (r)  { return Object.assign({}, r, { type: "宛先" }); }))
+      .concat(ccList.map(function (r)  { return Object.assign({}, r, { type: "CC"   }); }))
+      .concat(bccList.map(function (r) { return Object.assign({}, r, { type: "BCC"  }); }));
+
+    const external = allRecipients.filter(function (r) {
+      return !isInternalAddress(r.emailAddress);
+    });
+
+    if (external.length === 0) {
+      event.completed({ allowEvent: true });
+      return;
+    }
+
+    // --- 3) 警告メッセージを組み立てて送信をブロック ---
+    const externalList = external.map(function (r) {
+      const dn = (r.displayName && r.displayName !== r.emailAddress)
+        ? " (" + r.displayName + ")"
+        : "";
+      return "・[" + r.type + "] " + r.emailAddress + dn;
+    }).join("\n");
+
+    const msg =
+      "⚠ 誤送信チェック\n\n" +
+      "このメールは社内限定キーワードを含みますが、\n" +
+      "下記の社外アドレスが宛先に含まれています:\n\n" +
+      externalList + "\n\n" +
+      "本当に送信する場合は「送信」をもう一度押してください。" +
+      "確認のうえキャンセルする場合は「送信しない」を選んでください。";
+
+    event.completed({
+      allowEvent: false,
+      errorMessage: msg,
+      // PromptUser モード(manifest側で指定)では、ユーザーに送信続行 or キャンセルを選ばせる
+      sendModeOverride: Office.MailboxEnums.SendModeOverride.PromptUser
+    });
+
+  }).catch(function (err) {
+    // 例外時は安全側に倒す → 送信を許可(マクロでメールが詰まるのを避ける)
+    console.error("[誤送信チェック] エラー:", err);
+    event.completed({ allowEvent: true });
+  });
+}
+
+/* =====================================================================
+ *  ヘルパー: Office.AsyncCallback を Promise 化
+ * ===================================================================== */
+function getAsync(invoker) {
+  return new Promise(function (resolve, reject) {
+    invoker(function (result) {
+      if (result.status === Office.AsyncResultStatus.Succeeded) {
+        resolve(result.value);
+      } else {
+        reject(result.error);
+      }
+    });
+  });
+}
+
+/* =====================================================================
+ *  ヘルパー: 添付ファイル一覧(古いバージョン互換のため try/catch)
+ * ===================================================================== */
+function getAttachments(item) {
+  return new Promise(function (resolve) {
+    try {
+      if (typeof item.getAttachmentsAsync === "function") {
+        item.getAttachmentsAsync(function (r) {
+          resolve(r.status === Office.AsyncResultStatus.Succeeded ? r.value : []);
+        });
+      } else if (item.attachments) {
+        resolve(item.attachments);
+      } else {
+        resolve([]);
+      }
+    } catch (e) {
+      resolve([]);
+    }
+  });
+}
+
+/* =====================================================================
+ *  ヘルパー: キーワードが含まれるか(大文字小文字無視)
+ * ===================================================================== */
+function containsKeyword(text, keywords) {
+  if (!text || !keywords || keywords.length === 0) return false;
+  const lower = String(text).toLowerCase();
+  for (let i = 0; i < keywords.length; i++) {
+    const kw = String(keywords[i]).trim().toLowerCase();
+    if (kw && lower.indexOf(kw) >= 0) return true;
+  }
+  return false;
+}
+
+/* =====================================================================
+ *  ヘルパー: 社内ドメインかどうか
+ *   - @ がないアドレス(Exchange内部の特殊形式など)は社内扱い
+ * ===================================================================== */
+function isInternalAddress(email) {
+  if (!email) return true;
+  const at = email.indexOf("@");
+  if (at < 0) return true;
+  const domain = email.substring(at + 1).toLowerCase();
+  for (let i = 0; i < CONFIG.INTERNAL_DOMAINS.length; i++) {
+    if (domain === String(CONFIG.INTERNAL_DOMAINS[i]).toLowerCase()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/* =====================================================================
+ *  ハンドラを Office に登録(これが無いと OnMessageSend が動かない)
+ * ===================================================================== */
+Office.actions.associate("checkSendHandler", checkSendHandler);
